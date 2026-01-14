@@ -1,385 +1,251 @@
-"""
-Support TorchDynamo(https://github.com/facebookresearch/torchdynamo) backends
-"""
-
-import argparse
-import contextlib
-import distutils.util
-import functools
-import os
-import warnings
-from typing import List
-
+# Execution Command:
+# TORCHINDUCTOR_FREEZING=1 python inductor_quant_acc.py
 import torch
-import torchbenchmark
-from torchbenchmark.util.model import is_staged_train_test
-
-from torch.ao.quantization.observer import HistogramObserver, PerChannelMinMaxObserver
-from torch.ao.quantization.quantizer.quantizer import QuantizationSpec
-from torch.ao.quantization.quantizer.xnnpack_quantizer_utils import QuantizationConfig
-from typing import Any, Optional, TYPE_CHECKING
-if TYPE_CHECKING:
-    from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
-
-torch._inductor.config.force_disable_caches = True
-
-INDUCTOR_CONFIG_KEYS = [
-    "triton.cudagraphs",
-    "triton.unique_kernel_names",
-    "fallback_random",
-    "max_autotune_gemm",
-    "split_cat_fx_passes",
-    "group_fusion",
-    "batch_fusion",
-    "debug",
-]
+import torchvision.models as models
+import torch._inductor as torchinductor
+import copy
+import torchao
+from torchao.quantization.pt2e.quantize_pt2e import (
+    prepare_pt2e,
+    convert_pt2e,
+    prepare_qat_pt2e,
+)
+import torchao.quantization.pt2e.quantizer.x86_inductor_quantizer as xiq
+import torchao.quantization.pt2e.quantizer.xpu_inductor_quantizer as xpuiq
+from torch.export import export
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
 
 
-def _try_get_inductor_config():
-    try:
-        return torch._inductor.config.shallow_copy_dict()
-    except AttributeError:
-        # access torch inductor config directly
-        # if torch._inductor module does not has config attribute
-        from torch._inductor import config as inductor_config
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
 
-        return inductor_config.shallow_copy_dict()
+    def __init__(self, name, fmt=":f"):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
+        return fmtstr.format(**self.__dict__)
 
 
-def parse_torchdynamo_args(dynamo_args: List[str]) -> argparse.Namespace:
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+def run_model(model_name, args):
+    torchinductor.config.freezing = True
+    if args.cpp_wrapper:
+        print("using cpp_wrapper")
+        torchinductor.config.cpp_wrapper = args.cpp_wrapper
+    valdir = args.dataset_dir
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    )
+    val_loader = torch.utils.data.DataLoader(
+        datasets.ImageFolder(
+            valdir,
+            transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+        ),
+        batch_size=50,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+    cal_loader = copy.deepcopy(val_loader)
+    model = models.__dict__[model_name](pretrained=True)
+    if args.is_qat:
+        model = model.train()
+    else:
+        model = model.eval()
+    top1 = AverageMeter("Acc@1", ":6.2f")
+    top5 = AverageMeter("Acc@5", ":6.2f")
+    quant_top1 = AverageMeter("Acc@1", ":6.2f")
+    quant_top5 = AverageMeter("Acc@5", ":6.2f")
+    x = torch.randn(50, 3, 224, 224).contiguous(memory_format=torch.channels_last)
+    example_inputs = (x,)
+
+    # Calibration
+    if args.is_qat:
+        print("using qat")
+        for i, (images, _) in enumerate(cal_loader):
+            exported_model = export(model, (images,), strict=True).module()
+            if i == 10:
+                break
+        quantizer = xiq.X86InductorQuantizer()
+        quantizer.set_global(
+            xiq.get_default_x86_inductor_quantization_config(is_qat=True)
+        )
+        prepared_model = prepare_qat_pt2e(exported_model, quantizer)
+        lr = 0.0001
+        momentum = 0.9
+        weight_decay = 1e-4
+        optimizer = torch.optim.SGD(
+            prepared_model.parameters(),
+            lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+        optimizer.zero_grad()
+        criterion = torch.nn.CrossEntropyLoss()
+        for i, (images, target) in enumerate(val_loader):
+            # print(" start QAT Calibration step: {}".format(i), flush=True)
+            images = images
+            target = target
+            output = prepared_model(images)
+            loss = criterion(output, target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if i == 1:
+                break
+
+        with torch.no_grad():
+            converted_model = convert_pt2e(prepared_model)
+            torch.ao.quantization.move_exported_model_to_eval(converted_model)
+            # Lower into Inductor
+            optimized_model = torch.compile(converted_model)
+    elif args.is_fp32:
+        print("using fp32")
+        model = model.to(args.device)
+        with torch.no_grad():
+            optimized_model = torch.compile(model)
+    else:
+        print("using ptq")
+        model = model.to(args.device)
+        example_inputs = (x.to(args.device),)
+
+        with torch.no_grad():
+            exported_model = export(model, example_inputs, strict=True).module()
+            quantizer = None
+            if args.device == "xpu":
+                quantizer = xpuiq.XPUInductorQuantizer()
+                quantizer.set_global(
+                    xpuiq.get_default_xpu_inductor_quantization_config()
+                )
+            else:
+                quantizer = xiq.X86InductorQuantizer()
+                quantizer.set_global(xiq.get_default_x86_inductor_quantization_config())
+
+            # PT2E Quantization flow
+            prepared_model = prepare_pt2e(exported_model, quantizer)
+            # Calibration
+            prepared_model(*example_inputs)
+            converted_model = convert_pt2e(prepared_model)
+            torchao.quantization.pt2e.move_exported_model_to_eval(converted_model)
+            optimized_model = torch.compile(converted_model)
+    # Benchmark
+    with torch.no_grad():
+        for i, (images, target) in enumerate(val_loader):
+            images = images.to(args.device)
+            target = target.to(args.device)
+            quant_output = optimized_model(images)
+            quant_acc1, quant_acc5 = accuracy(quant_output, target, topk=(1, 5))
+            quant_top1.update(quant_acc1[0], images.size(0))
+            quant_top5.update(quant_acc5[0], images.size(0))
+        if args.is_fp32:
+            print(
+                model_name
+                + " fp32: "
+                + " * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}".format(
+                    top1=quant_top1, top5=quant_top5
+                )
+            )
+        else:
+            print(
+                model_name
+                + " int8: "
+                + " * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}".format(
+                    top1=quant_top1, top5=quant_top5
+                )
+            )
+
+
+if __name__ == "__main__":
+    model_list = [
+        "alexnet",
+        "mnasnet1_0",
+        "mobilenet_v2",
+        "mobilenet_v3_large",
+        "resnet152",
+        "resnet18",
+        "resnet50",
+        "resnext50_32x4d",
+        "shufflenet_v2_x1_0",
+        "squeezenet1_1",
+        "vgg16",
+    ]
+    import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--torchdynamo",
-        choices=["inductor"],
-        default=None,
-        help="Measure metrics with TorchInductor",
+        "--device",
+        default="cpu",
+        help="Device to run",
     )
     parser.add_argument(
-        "--inductor",
+        "--quantize",
         action="store_true",
-        help="Measure metrics with TorchInductor",
+        help="enable quantize for inductor",
     )
     parser.add_argument(
-        "--cold-start",
+        "--cpp_wrapper",
         action="store_true",
-        help="Use a fresh inductor and triton cachedir when running each model, to force cold-start compile.",
-    )
-    parser.add_argument(
-        "--inductor-compile-mode",
-        default=None,
-        choices=["max-autotune"],
-        help="torch.compile mode argument for inductor runs.",
-    )
-    parser.add_argument(
-        "--nopython", action="store_true", help="Turn graph breaks into errors"
-    )
-    parser.add_argument(
-        "--dynamic-shapes",
-        action="store_true",
-        help="Runs a dynamic shapes version of the benchmark, if available.",
-    )
-    parser.add_argument(
-        "--dynamic-batch-only",
-        action="store_true",
-        help="Only assume batch dimension is dynamic.  Implies --dynamic-shapes",
-    )
-    parser.add_argument(
-        "--dynamo_disable_optimizer_step",
-        type=distutils.util.strtobool,
-        default="false",
-    )
-    parser.add_argument(
-        "--pt2_debug_log",
-        action="store_true",
-        help="enable debug log for PT2 (dynamo, inductor, AOTAutograd)",
-    )
-    parser.add_argument(
-        "--quantization",
-        choices=["int8dynamic", "int8weightonly", "int4weightonly", "pt2e", "auto_quant"],
-        help="Apply quantization to the model before running it",
-    )
-    parser.add_argument(
-        "--torchinductor_compile_threads",
-        type=int,
-        help="""
-            Here are the precedence to decide compile_threads
-            1. User can override it by TORCHINDUCTOR_COMPILE_THREADS.  One may want to disable async compiling by
-            setting this to 1 to make pdb happy.
-            2. Set to 1 if it's win32 platform or it's a fbcode build
-            3. decide by the number of CPU cores
-            """,
-    )
-    parser.add_argument(
-        "--torchinductor_post_grad_batch_fusion",
-        action="store_true",
-        help="Enable post grad horizontal batch fusion",
-    )
-    parser.add_argument(
-        "--freeze_prepack_weights",
-        action="store_true",
-        help="set to freeze the graph and prepack weights",
+        help="enable cpp wrapper for inductor",
     )
     parser.add_argument(
         "--is_qat",
-        action='store_true',
+        action="store_true",
         help="enable qat quantization for inductor",
     )
-
-    # inductor boolean configs
-    inductor_config_dict = _try_get_inductor_config()
-    for inductor_config_key in INDUCTOR_CONFIG_KEYS:
-        inductor_config_key_arg = inductor_config_key.replace(".", "-")
-        parser.add_argument(
-            f"--pt2-{inductor_config_key_arg}",
-            action="store_true",
-            default=inductor_config_dict[inductor_config_key],
-        )
-        parser.add_argument(
-            f"--no-pt2-{inductor_config_key_arg}",
-            action="store_false",
-            default=None,
-        )
-    args, extra_args = parser.parse_known_args(dynamo_args)
-    # --torchdynamo inductor and --inductor are equivalent
-    if args.torchdynamo == "inductor":
-        args.inductor = True
-    if args.inductor:
-        args.torchdynamo = "inductor"
-    return args, extra_args
-
-
-def apply_torchdynamo_args(
-    model: "torchbenchmark.util.model.BenchmarkModel",
-    args: argparse.Namespace,
-    precision: str,
-):
-    if args.inductor:
-        optimize_ctx = functools.partial(
-            torch.compile,
-            backend="inductor",
-            fullgraph=args.nopython,
-            mode=args.inductor_compile_mode,
-        )
-        if args.dynamic_batch_only:
-            args.dynamic_shapes = True
-            torch._dynamo.config.assume_static_by_default = True
-        if args.dynamic_shapes:
-            if not args.dynamic_batch_only:
-                torch._dynamo.config.assume_static_by_default = False
-        if args.pt2_debug_log:
-            import logging
-
-            torch._logging.set_logs(
-                dynamo=logging.DEBUG, inductor=logging.DEBUG, aot=logging.DEBUG
-            )
-        # Load inductor configs
-        if bool(args.torchinductor_post_grad_batch_fusion):
-            torch._inductor.config.post_grad_fusion_options[
-                "batch_linear_post_grad"
-            ] = {}
-        if compile_threads := args.torchinductor_compile_threads:
-            os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(compile_threads)
-        # Deal with boolean inductor configs
-        inductor_config_dict = _try_get_inductor_config()
-        for inductor_config_key in INDUCTOR_CONFIG_KEYS:
-            inductor_config_key_arg = inductor_config_key.replace(".", "_")
-            if getattr(args, f"no_pt2_{inductor_config_key_arg}", None) == False:
-                torch._inductor.config.__setattr__(inductor_config_key, False)
-            else:
-                torch._inductor.config.__setattr__(
-                    inductor_config_key,
-                    getattr(
-                        args,
-                        f"pt2_{inductor_config_key_arg}",
-                        inductor_config_dict[inductor_config_key],
-                    ),
-                )
-
-        if args.quantization:
-            import torchao
-            if model.device == "cuda":
-                from torchao.quantization import (
-                    change_linear_weights_to_int4_woqtensors,
-                    change_linear_weights_to_int8_dqtensors,
-                    change_linear_weights_to_int8_woqtensors,
-                )
-
-                torch._dynamo.config.automatic_dynamic_shapes = False
-                torch._dynamo.config.force_parameter_static_shapes = False
-                torch._dynamo.config.cache_size_limit = 1000
-            
-                module, example_inputs = model.get_module()
-                if args.quantization == "int8dynamic":
-                    torch._inductor.config.force_fuse_int_mm_with_mul = True
-                    change_linear_weights_to_int8_dqtensors(module)
-                elif args.quantization == "int8weightonly":
-                    torch._inductor.config.use_mixed_mm = True
-                    change_linear_weights_to_int8_woqtensors(module)
-                elif args.quantization == "int4weightonly":
-                    change_linear_weights_to_int4_woqtensors(module)
-            elif (model.device == "cpu" or model.device == "xpu") and model.test == "eval":
-                if args.quantization == "pt2e":
-                    enable_inductor_quant(model, args.is_qat)
-                elif args.quantization == "auto_quant":
-                    from torchao.quantization import quantize_, int8_dynamic_activation_int8_weight, int8_weight_only
-                    module, example_inputs = model.get_module()
-                    with torch.no_grad():
-                        from torchao.utils import unwrap_tensor_subclass
-                        #module = unwrap_tensor_subclass(module)
-                        #quantize_(module, int8_weight_only())
-                        module=torchao.autoquant(torch.compile(module, mode='max-autotune'))
-                        if isinstance(example_inputs, dict):
-                            module(**example_inputs)
-                        else:
-                            module(*example_inputs)
-                        model.set_module(module)
-
-        if args.freeze_prepack_weights:
-            torch._inductor.config.freezing = True
-            torch._inductor.config.cpp.weight_prepack = True
-
-    if bool(args.dynamo_disable_optimizer_step):
-        found_optimizer_step = False
-        try:
-            model.cfg.optimizer.step = torch._dynamo.disable(model.cfg.optimizer.step)
-            found_optimizer_step = True
-        except AttributeError:
-            pass
-
-        try:
-            model.optimizer.step = torch._dynamo.disable(model.optimizer.step)
-            found_optimizer_step = True
-        except AttributeError:
-            pass
-
-        if not found_optimizer_step:
-            warnings.warn(
-                "--dynamo_disable_optimizer_step is set to True, but the optimizer could not be found on this model"
-            )
-
-    if args.cold_start:
-        from torch._inductor.utils import fresh_inductor_cache
-        fresh_inductor_context = lambda: fresh_inductor_cache()
-        model.run_contexts.append(fresh_inductor_context)
-    if model.test == "train":
-        if is_staged_train_test(model):
-            model.forward = optimize_ctx(model.forward)
-        else:
-            model.train = optimize_ctx(model.train)
-    else:
-        model.eval = optimize_ctx(model.eval)
-
-    torch._dynamo.reset()
-
-def get_xpu_inductor_symm_quantization_config():
-    extra_args: dict[str, Any] = {"eps": 2**-12}
-    act_observer_or_fake_quant_ctr = HistogramObserver
-    act_quantization_spec = QuantizationSpec(
-        dtype=torch.int8,
-        quant_min=-128,
-        quant_max=127,
-        qscheme=torch.per_tensor_symmetric,
-        is_dynamic=False,
-        observer_or_fake_quant_ctr=act_observer_or_fake_quant_ctr.with_args(
-            **extra_args
-        ),
+    parser.add_argument(
+        "--is_fp32",
+        action="store_true",
+        help="fp32 inductor",
     )
-
-    weight_observer_or_fake_quant_ctr: _ObserverOrFakeQuantizeConstructor = (
-        PerChannelMinMaxObserver
+    parser.add_argument(
+        "--dataset_dir",
+        default="/workspace/benchmark/imagenet/val/",
+        help="ImageNet dir",
     )
-
-    weight_quantization_spec = QuantizationSpec(
-        dtype=torch.int8,
-        quant_min=-128,
-        quant_max=127,
-        qscheme=torch.per_channel_symmetric,
-        ch_axis=0,  # 0 corresponding to weight shape = (oc, ic, kh, kw) of conv
-        is_dynamic=False,
-        observer_or_fake_quant_ctr=weight_observer_or_fake_quant_ctr.with_args(
-            **extra_args
-        ),
+    parser.add_argument(
+        "--model_list",
+        default=None,
+        help="Models list, such as: alexnet,resnet50 which split with ,",
     )
-
-    bias_quantization_spec = None  # will use placeholder observer by default
-    quantization_config = QuantizationConfig(
-        act_quantization_spec,
-        act_quantization_spec,
-        weight_quantization_spec,
-        bias_quantization_spec,
-        False,
-    )
-    return quantization_config
-
-def enable_inductor_quant(model: 'torchbenchmark.util.model.BenchmarkModel', is_qat: 'bool'=False):
-    from torch.ao.quantization.quantize_pt2e import prepare_pt2e, prepare_qat_pt2e, convert_pt2e
-    import torch.ao.quantization.quantizer.xpu_inductor_quantizer as xiq
-    from torch.export import Dim, export_for_training
-    module, example_inputs = model.get_module()
-    torch._inductor.config.freezing = True
-
-    if isinstance(example_inputs, dict):
-        input_ids = torch.randn(2, 512).to(torch.long)
-        example_inputs = {
-            "input_ids": input_ids,
-        }
-        input_shapes = {k: list(v.shape) for (k, v) in example_inputs.items()}
-        dims = set()
-        for _, v in input_shapes.items():
-            dims.update(v)
-            dims=sorted(dims)
-        #dim_str_map = {x: Dim("dim" + str(list(dims).index(x))) for x in dims}
-        dim_str_map = {x: Dim("dim" + str(list(dims).index(x)), min=1, max=1024 * 1024) for x in dims}
-        dynamic_shapes = {k: {v.index(dim): dim_str_map[dim] for dim in v} for (k, v) in input_shapes.items()}
-        del dynamic_shapes["input_ids"][1]
-    # Create X86InductorQuantizer
-    quantizer = xiq.XPUInductorQuantizer()
-    qscheme = os.getenv("XPU_QUANT_CONFIG")
-    if (qscheme is None) or qscheme=="ASYMM":
-        quantizer.set_global(xiq.get_default_xpu_inductor_quantization_config())
-    elif qscheme=="SYMM":
-        quantizer.set_global(get_xpu_inductor_symm_quantization_config())
-    else:
-        raise ValueError("Invalid XPU_QUANT_CONFIG")
-    if is_qat:
-        module.train()
-    # Generate the FX Module
-    if isinstance(example_inputs, dict):
-        input_ids = torch.ones(2, 512).to(torch.long).to('xpu')
-        example_inputs = {
-            "input_ids": input_ids,
-        }
-        exported_model = export_for_training(
-            module,
-            (),
-            example_inputs,
-            dynamic_shapes=dynamic_shapes,
-            strict=True
-        ).module()
-    else:
-        exported_model = export_for_training(
-            module,
-            example_inputs,
-            strict=True
-        ).module()
-
-    for name, buffer in exported_model.named_buffers():
-        if not buffer.is_xpu:
-            buffer.data = buffer.to('xpu')
-    # PT2E Quantization flow
-    prepared_model = prepare_qat_pt2e(exported_model, quantizer) if is_qat else prepare_pt2e(exported_model, quantizer)
-    # Calibration
-    if is_qat:
-        model.example_outputs = (torch.rand_like(module(*example_inputs)), )
-        model.loss_fn = torch.nn.CrossEntropyLoss()
-        model.set_module(prepared_model)
-        model.train()
-    else:
-        if isinstance(example_inputs, dict):
-            prepared_model(**example_inputs)
-        else:
-            prepared_model(*example_inputs)
-    with torch.no_grad():
-        converted_model = convert_pt2e(prepared_model)
-        torch.ao.quantization.move_exported_model_to_eval(converted_model)
-        model.set_module(converted_model)
+    args = parser.parse_args()
+    for model in model_list if args.model_list is None else args.model_list.split(","):
+        run_model(model, args)
